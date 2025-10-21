@@ -375,6 +375,155 @@ async fn get_account_balance(address: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+async fn get_user_balance(state: State<'_, AppState>) -> Result<String, String> {
+    let account = get_active_account(&state).await?;
+    get_balance(&account).await
+}
+
+#[tauri::command]
+async fn can_afford_download(state: State<'_, AppState>, price: f64) -> Result<bool, String> {
+    let account = get_active_account(&state).await?;
+    let balance_str = get_balance(&account).await?;
+    let balance = balance_str.parse::<f64>()
+        .map_err(|e| format!("Failed to parse balance: {}", e))?;
+    Ok(balance >= price)
+}
+
+#[tauri::command]
+async fn process_download_payment(
+    state: State<'_, AppState>,
+    uploader_address: String,
+    price: f64,
+) -> Result<String, String> {
+    // Get the active account address
+    let account = get_active_account(&state).await?;
+
+    // Get the private key from state
+    let private_key = {
+        let key_guard = state.active_account_private_key.lock().await;
+        key_guard
+            .clone()
+            .ok_or("No private key available. Please log in again.")?
+    };
+
+    // Send the payment transaction
+    ethereum::send_transaction(&account, &uploader_address, price, &private_key).await
+}
+
+#[tauri::command]
+async fn record_download_payment(
+    app: tauri::AppHandle,
+    file_hash: String,
+    file_name: String,
+    file_size: u64,
+    seeder_wallet_address: String,
+    seeder_peer_id: String,
+    downloader_address: String,
+    amount: f64,
+    transaction_id: u64,
+    transaction_hash: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    println!(
+        "📝 Download payment recorded: {} Chiral to wallet {} (peer: {}) tx: {}",
+        amount, seeder_wallet_address, seeder_peer_id, transaction_hash
+    );
+
+    // Send P2P payment notification message to the seeder's peer
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct PaymentNotificationMessage {
+        file_hash: String,
+        file_name: String,
+        file_size: u64,
+        downloader_address: String,
+        seeder_wallet_address: String,
+        amount: f64,
+        transaction_id: u64,
+        transaction_hash: String,
+    }
+
+    let payment_msg = PaymentNotificationMessage {
+        file_hash,
+        file_name,
+        file_size,
+        downloader_address,
+        seeder_wallet_address: seeder_wallet_address.clone(),
+        amount,
+        transaction_id,
+        transaction_hash: transaction_hash.clone(),
+    };
+
+    // Serialize the payment message
+    let payment_json = serde_json::to_string(&payment_msg)
+        .map_err(|e| format!("Failed to serialize payment message: {}", e))?;
+
+    // Emit local event for payment notification (works on same machine for testing)
+    app.emit("seeder_payment_received", payment_msg.clone())
+        .map_err(|e| format!("Failed to emit payment notification: {}", e))?;
+
+    println!("✅ Payment notification emitted locally for seeder: {}", seeder_wallet_address);
+
+    // Send P2P payment notification to the seeder's peer
+    let dht = {
+        let dht_guard = state.dht.lock().await;
+        dht_guard.as_ref().cloned()
+    };
+
+    if let Some(dht) = dht {
+        // Convert payment message to JSON
+        let notification_json = serde_json::to_value(&payment_msg)
+            .map_err(|e| format!("Failed to serialize payment notification: {}", e))?;
+
+        // Wrap in a payment notification envelope so receiver can identify it
+        let wrapped_message = serde_json::json!({
+            "type": "payment_notification",
+            "payload": notification_json
+        });
+
+        // Send via DHT to the seeder's peer ID
+        match dht.send_message_to_peer(&seeder_peer_id, wrapped_message).await {
+            Ok(_) => {
+                println!("✅ P2P payment notification sent to peer: {}", seeder_peer_id);
+            }
+            Err(e) => {
+                // Don't fail the whole operation if P2P message fails
+                println!("⚠️ Failed to send P2P payment notification: {}. Seeder will see payment when they check blockchain.", e);
+            }
+        }
+    } else {
+        println!("⚠️ DHT not available, payment notification only sent locally");
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn record_seeder_payment(
+    _file_hash: String,
+    _file_name: String,
+    _file_size: u64,
+    _downloader_address: String,
+    _amount: f64,
+    _transaction_id: u64,
+) -> Result<(), String> {
+    // Log the seeder payment receipt for analytics/audit purposes
+    println!("💰 Seeder payment received: {} Chiral from {}", _amount, _downloader_address);
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_payment_notifications(
+    _wallet_address: String,
+    _state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    // NOTE: This command is kept for compatibility but not used anymore
+    // Payment notifications are now handled via local events (seeder_payment_received)
+    // For testing on same machine, the event system works fine
+    // For cross-peer payments, this would need to be implemented with P2P messaging
+    Ok(vec![])
+}
+
+#[tauri::command]
 async fn get_network_peer_count() -> Result<u32, String> {
     get_peer_count().await
 }
@@ -533,7 +682,10 @@ async fn upload_versioned_file(
     is_encrypted: bool,
     encryption_method: Option<String>,
     key_fingerprint: Option<String>,
+    price: Option<f64>,
 ) -> Result<FileMetadata, String> {
+    // Get the active account address
+    let account = get_active_account(&state).await?;
     let dht_opt = { state.dht.lock().await.as_ref().cloned() };
     if let Some(dht) = dht_opt {
         // --- FIX: Calculate file_hash using file_transfer helper
@@ -560,6 +712,8 @@ async fn upload_versioned_file(
                 is_encrypted,
                 encryption_method,
                 key_fingerprint,
+                price,
+                Some(account.clone()),
             )
             .await?;
 
@@ -1031,6 +1185,24 @@ async fn start_dht_node(
                         });
                         let _ = app_handle.emit("bitswap_chunk_downloaded", payload);
                     },
+                    DhtEvent::PaymentNotificationReceived { from_peer, payload } => {
+                        println!("💰 Payment notification received from peer {}: {:?}", from_peer, payload);
+                        // Convert payload to match the expected format for seeder_payment_received
+                        if let Ok(notification) = serde_json::from_value::<serde_json::Value>(payload.clone()) {
+                            let formatted_payload = serde_json::json!({
+                                "file_hash": notification.get("file_hash").and_then(|v| v.as_str()).unwrap_or(""),
+                                "file_name": notification.get("file_name").and_then(|v| v.as_str()).unwrap_or(""),
+                                "file_size": notification.get("file_size").and_then(|v| v.as_u64()).unwrap_or(0),
+                                "downloader_address": notification.get("downloader_address").and_then(|v| v.as_str()).unwrap_or(""),
+                                "seeder_wallet_address": notification.get("seeder_wallet_address").and_then(|v| v.as_str()).unwrap_or(""),
+                                "amount": notification.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                "transaction_id": notification.get("transaction_id").and_then(|v| v.as_u64()).unwrap_or(0),
+                            });
+                            // Emit the same event that local payments use
+                            let _ = app_handle.emit("seeder_payment_received", formatted_payload);
+                            println!("✅ Payment notification forwarded to frontend");
+                        }
+                    },
                     _ => {}
                 }
             }
@@ -1364,6 +1536,9 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                 }
                 DhtEvent::BitswapChunkDownloaded { file_hash, chunk_index, total_chunks, chunk_size } => {
                     format!("bitswap_chunk_downloaded:{}:{}:{}:{}", file_hash, chunk_index, total_chunks, chunk_size)
+                },
+                DhtEvent::PaymentNotificationReceived { from_peer, payload } => {
+                    format!("payment_notification_received:{}:{:?}", from_peer, payload)
                 },
                 DhtEvent::ReputationEvent {
                     peer_id,
@@ -1944,7 +2119,10 @@ async fn start_file_transfer_service(
 async fn upload_file_to_network(
     state: State<'_, AppState>,
     file_path: String,
+    price: Option<f64>,
 ) -> Result<(), String> {
+    println!("🔍 BACKEND: upload_file_to_network called with price: {:?}", price);
+
     // Get the active account address
     let account = get_active_account(&state).await?;
 
@@ -1968,7 +2146,7 @@ async fn upload_file_to_network(
         ft.upload_file_with_account(
             file_path.clone(),
             file_name.to_string(),
-            Some(account),
+            Some(account.clone()),
             Some(private_key),
         )
         .await
@@ -2006,8 +2184,12 @@ async fn upload_file_to_network(
                 version: Some(1),
                 cids: None,
                 encrypted_key_bundle: None,
+                price,
+                uploader_address: Some(account.clone()),
                 ..Default::default()
             };
+
+            println!("📦 BACKEND: Created FileMetadata with price: {:?}, uploader: {:?}", metadata.price, metadata.uploader_address);
 
             match dht.publish_file(metadata.clone()).await {
                 Ok(_) => info!("Published file metadata to DHT: {}", file_hash),
@@ -2323,6 +2505,14 @@ async fn save_temp_file_for_upload(
     Ok(temp_file_path.to_string_lossy().to_string())
 }
 
+/// Get file size in bytes
+#[tauri::command]
+async fn get_file_size(file_path: String) -> Result<u64, String> {
+    let metadata = fs::metadata(&file_path)
+        .map_err(|e| format!("Failed to get file metadata: {}", e))?;
+    Ok(metadata.len())
+}
+
 #[tauri::command]
 async fn start_streaming_upload(
     file_name: String,
@@ -2461,6 +2651,8 @@ async fn upload_file_chunk(
             parent_hash: None,
             is_root: true,
             download_path: None,
+            price: None,
+            uploader_address: None,
         };
 
         // Store complete file data locally for seeding
@@ -3809,6 +4001,12 @@ fn main() {
             create_chiral_account,
             import_chiral_account,
             has_active_account,
+            get_user_balance,
+            can_afford_download,
+            process_download_payment,
+            record_download_payment,
+            record_seeder_payment,
+            check_payment_notifications,
             get_network_peer_count,
             start_geth_node,
             stop_geth_node,
@@ -3914,6 +4112,7 @@ fn main() {
             get_contribution_history,
             reset_analytics,
             save_temp_file_for_upload,
+            get_file_size,
             encrypt_file_for_self_upload,
             encrypt_file_for_recipient,
             upload_and_publish_file,
@@ -4234,7 +4433,13 @@ async fn upload_and_publish_file(
     file_path: String,
     file_name: Option<String>,
     recipient_public_key: Option<String>,
+    price: Option<f64>,
 ) -> Result<UploadResult, String> {
+    println!("🔍 BACKEND: upload_and_publish_file called with price: {:?}", price);
+
+    // Get the active account address
+    let account = get_active_account(&state).await?;
+
     // 1. Process file with ChunkManager (encrypt, chunk, build Merkle tree)
     let manifest = encrypt_file_for_recipient(
         app.clone(),
@@ -4292,8 +4497,12 @@ async fn upload_and_publish_file(
                 true,                            // is_encrypted
                 Some("AES-256-GCM".to_string()), // Encryption method
                 None,                            // key_fingerprint (deprecated)
+                price,                           // price
+                Some(account.clone()),           // uploader_address
             )
             .await?;
+
+        println!("📦 BACKEND: Created versioned metadata with price: {:?}, uploader: {:?}", metadata.price, metadata.uploader_address);
 
         let version = metadata.version.unwrap_or(1);
 
